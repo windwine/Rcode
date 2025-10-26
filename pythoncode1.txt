@@ -12,7 +12,7 @@ delta2 = -0.45
 securityID1 = 109820   # SPY
 securityID2 = 106445   # IWM
 
-DATA_PATH = Path("data/")  # adjust this path
+DATA_PATH = Path("data/")  # adjust this to your folder
 file_stock = DATA_PATH / "stockreturnsETF.csv"
 file1 = DATA_PATH / ("%dallinfo_%d.csv" % (securityID1, nweeks))
 file2 = DATA_PATH / ("%dallinfo_%d.csv" % (securityID2, nweeks))
@@ -27,14 +27,14 @@ stockprices = stockprices.query("SecurityID in @ids").copy()
 def rolling_sma(x, n):
     return x.rolling(window=n, min_periods=n).mean()
 
-out = []
+pieces = []
 for sid, g in stockprices.groupby("SecurityID"):
     g = g.sort_values("Date")
     g["RV1"] = np.sqrt(rolling_sma(g["ret"]**2, 20)) * np.sqrt(252)
     g["RV2"] = np.sqrt(rolling_sma(g["ret"]**2, 5))  * np.sqrt(252)
     g["ret5"] = rolling_sma(g["ret"], 5)
-    out.append(g[["Date","SecurityID","RV1","RV2","ret","ret5"]])
-stockRV = pd.concat(out).dropna().reset_index(drop=True)
+    pieces.append(g[["Date","SecurityID","RV1","RV2","ret","ret5"]])
+stockRV = pd.concat(pieces).dropna().reset_index(drop=True)
 
 # ============================================================
 # 2) LOAD OPTION FILES
@@ -47,14 +47,14 @@ data2 = pd.merge(data2, stockRV.query("SecurityID == @securityID2"), on="Date", 
 
 for df, sid in [(data1, securityID1), (data2, securityID2)]:
     df["dolgamma"] = df["Gamma"] * df["startprice"]**2
-    df.rename(columns={"Vega": "startvega", "S_PnL": "hedgeret"}, inplace=True)
+    df.rename(columns={"Vega":"startvega", "S_PnL":"hedgeret"}, inplace=True)
     df["startdate"] = df["Date"]
     df["securityID"] = sid
     df["vegP"] = df["startvega"] * df["IV"] * 10
 
-data1["PnL"]  = data1["startcost"] - data1["endcost"] + data1["startspread"] * 0.35 - data1["hedgeret"]
-data1["PnL2"] = data1["startcost"] - data1["endcost"] - data1["startspread"] * 0.35 - data1["hedgeret"]
-data2["PnL"]  = data2["startcost"] - data2["endcost"] - data2["startspread"] * 0.35 - data2["hedgeret"]
+data1["PnL"]  = data1["startcost"] - data1["endcost"] + data1["startspread"]*0.35 - data1["hedgeret"]
+data1["PnL2"] = data1["startcost"] - data1["endcost"] - data1["startspread"]*0.35 - data1["hedgeret"]
+data2["PnL"]  = data2["startcost"] - data2["endcost"] - data2["startspread"]*0.35 - data2["hedgeret"]
 
 # ============================================================
 # 3) SPY PORTFOLIO SUMMARY
@@ -77,11 +77,16 @@ data1Port = pd.DataFrame(rows).dropna().reset_index(drop=True)
 data1Port["PnL_cum"] = (data1Port["AVGPnL"] / (data1Port["AVGVEGAp"] + 1e-9)).cumsum()
 
 # ============================================================
-# 4) PAIR BACKTEST LOOP
+# 4) PAIR BACKTEST LOOP (R-style indexing)
 # ============================================================
 finaldata = []
-for _, row in data1Port.iterrows():
-    currentdate = row["Date"]
+obs = len(data1Port)
+Dates = list(data1Port["Date"])
+
+print("Running backtest on %d observation dates..." % obs)
+
+for i in range(obs):
+    currentdate = Dates[i]
     SPYdata = data1Port.query("Date == @currentdate")
     if SPYdata.empty:
         continue
@@ -95,74 +100,90 @@ for _, row in data1Port.iterrows():
     if IWM.empty:
         continue
 
+    # --- Vega weighting & hedging ---
     IWM["w"] = IWM["startvega"] / SPYvega
     IWM["tuneD"] = np.where(IWM["Delta"] <= -0.05, 1, 1)
     IWM["tune2"] = np.where(IWM["ret"] >= -0.02, 1, 1)
     IWM["hedgeret2"] = IWM["hedgeret"] * IWM["tuneD"] * IWM["tune2"]
-    IWM["PnL"] = IWM["startcost"] - IWM["endcost"] - IWM["startspread"] * 0.35 - IWM["hedgeret2"]
+    IWM["PnL"] = IWM["startcost"] - IWM["endcost"] - IWM["startspread"]*0.35 - IWM["hedgeret2"]
 
     IWM["RBexit"] = 0
     IWM["time2mat"] = 7
     IWM["w"] = np.where(IWM["RBexit"] == 2, 1, IWM["w"])
-    IWM["portPnL"] = IWM["PnL"] / IWM["w"] - SPYPnL * 0.95
-    IWM["portPnLV"] = IWM["portPnL"] / SPYvegaP
-
+    IWM["portPnL"] = IWM["PnL"]/IWM["w"] - SPYPnL*0.95
+    IWM["portPnLV"] = IWM["portPnL"]/SPYvegaP
     IWM = pd.merge(IWM, SPYdata, on="Date", how="left")
 
-    if IWM["RBexit"].iloc[0] == 2:
-        IWM["VRPw1"], IWM["VRPw2"] = 1, 1
-    else:
-        IWM["IWMVRP"] = IWM["IV"] - IWM["RV1"]
-        IWM["SPYVRP"] = IWM["AVGIV"] - IWM["RV"]
-        IWM["VRPgap"] = IWM["IWMVRP"] - IWM["SPYVRP"]
-        IWM["VRPgapabs"] = np.where(IWM["VRPgap"] > 0, IWM["VRPgap"], 1e-10)
-        IWM["IWMVRP2"] = IWM["IV"] - IWM["RV2"]
-        IWM["opw"] = IWM["VRPgapabs"] / IWM["VRPgapabs"].sum()
-        IWM["VRPw1"] = np.where(IWM["IWMVRP"] < IWM["SPYVRP"], 0.5, 1)
-        IWM["VRPw2"] = np.where((IWM["IWMVRP"] < 0) & (IWM["IWMVRP2"] < 0), 0.5, 1)
+    IWM["IWMVRP"] = IWM["IV"] - IWM["RV1"]
+    IWM["SPYVRP"] = IWM["AVGIV"] - IWM["RV"]
+    IWM["VRPgap"] = IWM["IWMVRP"] - IWM["SPYVRP"]
+    IWM["VRPgapabs"] = np.where(IWM["VRPgap"] > 0, IWM["VRPgap"], 1e-10)
+    IWM["IWMVRP2"] = IWM["IV"] - IWM["RV2"]
+    IWM["opw"] = IWM["VRPgapabs"]/IWM["VRPgapabs"].sum()
+    IWM["VRPw1"] = np.where(IWM["IWMVRP"] < IWM["SPYVRP"], 0.5, 1)
+    IWM["VRPw2"] = np.where((IWM["IWMVRP"] < 0) & (IWM["IWMVRP2"] < 0), 0.5, 1)
 
-    IWM["T"] = IWM["time2mat"] / 365.0
-    IWM["d1"] = (np.log(IWM["startprice"] / IWM["K"]) + (IWM["IV"]**2) * IWM["T"] / 2) / (IWM["IV"] * np.sqrt(IWM["T"]))
-    IWM["d2"] = IWM["d1"] - IWM["IV"] * np.sqrt(IWM["T"])
-    IWM["Vomma"] = IWM["startvega"] * (IWM["d1"] * IWM["d2"] / IWM["IV"])
-    IWM["netprem"] = IWM["startcost"] / IWM["w"] - IWM["AVGprem"]
-    IWM["grossprem"] = IWM["startcost"] / IWM["w"] + IWM["AVGprem"]
-    IWM["down"] = IWM["startprice"] * 0.9
+    IWM["T"] = IWM["time2mat"]/365.0
+    IWM["d1"] = (np.log(IWM["startprice"]/IWM["K"]) + (IWM["IV"]**2)*IWM["T"]/2) / (IWM["IV"]*np.sqrt(IWM["T"]))
+    IWM["d2"] = IWM["d1"] - IWM["IV"]*np.sqrt(IWM["T"])
+    IWM["Vomma"] = IWM["startvega"]*(IWM["d1"]*IWM["d2"]/IWM["IV"])
+    IWM["netprem"] = IWM["startcost"]/IWM["w"] - IWM["AVGprem"]
+    IWM["grossprem"] = IWM["startcost"]/IWM["w"] + IWM["AVGprem"]
+    IWM["down"] = IWM["startprice"]*0.9
     IWM["optionvalue"] = np.where(IWM["K"] < IWM["down"], 0, IWM["K"] - IWM["down"])
-    IWM["stockvalue"] = -1 * IWM["Delta"] * (IWM["down"] - IWM["startprice"])
+    IWM["stockvalue"] = -1*IWM["Delta"]*(IWM["down"] - IWM["startprice"])
 
     finaldata.append(IWM)
 
+    # --- progress every 20 iterations ---
+    if (i+1) % 20 == 0 or i == obs - 1:
+        print("Processed %d / %d dates (current: %s)" % (i+1, obs, currentdate))
+
 # ============================================================
-# 5) AGGREGATE RESULTS
+# 5) RESULTS + INTERMEDIATE PRINTS
 # ============================================================
-if len(finaldata) > 0:
+if len(finaldata) == 0:
+    print("⚠️  No valid trades found.")
+else:
     alltrades = pd.concat(finaldata, ignore_index=True)
     alltrades["VRPw"] = alltrades["VRPw1"] * alltrades["VRPw2"]
 
+    # Detect no-trade days
     notrade = (
         alltrades.groupby("Date")["VRPw"].sum().reset_index()
         .query("VRPw < 1e-6")["Date"].unique()
     )
-    print("No-trade Dates:", notrade)
+    if len(notrade) > 0:
+        print("No-trade Dates:", notrade)
 
+    # --- Daily aggregation ---
     valid = alltrades.query("Date >= '2012-01-01'")
-    result_rows = []
+    out = []
     for d, g in valid.groupby("Date"):
         totalPnL  = np.mean(g["portPnL"]  * g["VRPw"])
         totalPnLV = np.mean(g["portPnLV"] * g["VRPw"])
-        result_rows.append({"Date": d, "totalPnL": totalPnL, "totalPnLV": totalPnLV})
-    finalPnL = pd.DataFrame(result_rows).dropna()
+        out.append({"Date": d, "totalPnL": totalPnL, "totalPnLV": totalPnLV})
+        # Print intermediate every ~100 steps
+        if len(out) % 100 == 0:
+            print("Interim cumulative PnL on %s: %.4f"
+                  % (d, np.sum([r["totalPnLV"] for r in out])))
+
+    finalPnL = pd.DataFrame(out).dropna()
     finalPnL["cumPnL_V"] = finalPnL["totalPnLV"].cumsum()
 
+    # --- Summary printout ---
     strat = finalPnL["totalPnLV"]
     ann_sharpe = strat.mean() / strat.std() * np.sqrt(52)
-    print("\nAnnualized Sharpe (1/VegaP): %.2f" % ann_sharpe)
+    print("\n==== BACKTEST SUMMARY ====")
+    print("First date:", finalPnL["Date"].iloc[0])
+    print("Last date :", finalPnL["Date"].iloc[-1])
+    print("Total obs :", len(finalPnL))
+    print("Annualized Sharpe (1/VegaP): %.2f" % ann_sharpe)
+    print("==========================\n")
 
+    # --- Plot cumulative PnL ---
     plt.figure(figsize=(10,5))
     plt.plot(pd.to_datetime(finalPnL["Date"]), finalPnL["cumPnL_V"])
-    plt.title("ETF Pairs 1/VegaP %d-%d n_week=%d" % (securityID1, securityID2, nweeks))
+    plt.title("ETF Pairs 1/VegaP %d-%d  n_week=%d" % (securityID1, securityID2, nweeks))
     plt.xlabel("Date"); plt.ylabel("Cumulative PnL (1/VegaP)")
     plt.grid(True); plt.show()
-else:
-    print("No valid trade data found.")
