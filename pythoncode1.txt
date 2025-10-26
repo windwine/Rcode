@@ -1,0 +1,197 @@
+import pandas as pd
+import numpy as np
+import math
+from pathlib import Path
+
+# ============================================================
+# 0) CONFIGURATION
+# ============================================================
+nweeks = 1
+delta2 = -0.45
+securityID1 = 109820   # 
+securityID2 = 106445   # 
+
+# Paths
+DATA_PATH = Path("data/")  # adjust this to your folder
+file_stock = DATA_PATH / "stockreturnsETF.csv"
+file1 = DATA_PATH / f"{securityID1}allinfo_{nweeks}.csv"
+file2 = DATA_PATH / f"{securityID2}allinfo_{nweeks}.csv"
+
+# ============================================================
+# 1) LOAD STOCK PRICES AND COMPUTE RV1 / RV2 / ret5
+# ============================================================
+stockprices = pd.read_csv(file_stock)
+ids = [106445, 109820, 107899]
+stockprices = stockprices[stockprices["SecurityID"].isin(ids)].copy()
+
+def rolling_sma(x, n):
+    return x.rolling(n, min_periods=n).mean()
+
+stockRV = (
+    stockprices
+    .groupby("SecurityID", group_keys=False)
+    .apply(lambda g: g.assign(
+        RV1=np.sqrt(rolling_sma(g["ret"]**2, 20)) * np.sqrt(252),
+        RV2=np.sqrt(rolling_sma(g["ret"]**2, 5))  * np.sqrt(252),
+        ret5=rolling_sma(g["ret"], 5)
+    ))
+    .loc[:, ["Date","SecurityID","RV1","RV2","ret","ret5"]]
+    .dropna()
+    .reset_index(drop=True)
+)
+
+# ============================================================
+# 2) LOAD OPTION FILES (SPY and IWM)
+# ============================================================
+data1 = pd.read_csv(file1)
+data2 = pd.read_csv(file2)
+
+# Merge with stock RV
+data1 = data1.merge(stockRV.query(f"SecurityID == {securityID1}"), on="Date", how="inner")
+data2 = data2.merge(stockRV.query(f"SecurityID == {securityID2}"), on="Date", how="inner")
+
+# Common preprocessing
+for df, sid in [(data1, securityID1), (data2, securityID2)]:
+    df["dolgamma"] = df["Gamma"] * df["startprice"]**2
+    df.rename(columns={"Vega": "startvega", "S_PnL": "hedgeret"}, inplace=True)
+    df["startdate"] = df["Date"]
+    df["securityID"] = sid
+    df["vegP"] = df["startvega"] * df["IV"] * 10
+
+# Compute PnL variants
+data1["PnL"]  = data1["startcost"] - data1["endcost"] + data1["startspread"] * 0.35 - data1["hedgeret"]
+data1["PnL2"] = data1["startcost"] - data1["endcost"] - data1["startspread"] * 0.35 - data1["hedgeret"]
+
+data2["PnL"]  = data2["startcost"] - data2["endcost"] - data2["startspread"] * 0.35 - data2["hedgeret"]
+
+# ============================================================
+# 3) BUILD SPY PORTFOLIO SUMMARY (data1Port)
+# ============================================================
+data1Port = (
+    data1.query(f"Delta <= {delta2}")
+    .groupby("Date", as_index=False)
+    .agg(
+        AVGPnL=("PnL","mean"),
+        AVGVEGA=("startvega","mean"),
+        AVGVEGAp=("vegP","mean"),
+        numOP=("PnL","size"),
+        AVGIV=("IV","mean"),
+        RV=("RV1","min"),
+        RV_2=("RV2","min"),
+        AVGprem=("startcost","mean")
+    )
+    .dropna()
+)
+
+# Cumulative PnL series
+data1Port["PnL_cum"] = (data1Port["AVGPnL"] / (data1Port["AVGVEGAp"] + 1e-9)).cumsum()
+
+# ============================================================
+# 4) PAIR BACKTEST LOOP
+# ============================================================
+finaldata = []
+for _, row in data1Port.iterrows():
+    currentdate = row["Date"]
+    SPYdata = data1Port.query("Date == @currentdate").copy()
+    SPYvega = SPYdata["AVGVEGA"].iloc[0]
+    SPYvegaP = SPYdata["AVGVEGAp"].iloc[0]
+    SPYPnL = SPYdata["AVGPnL"].iloc[0]
+    SPYPrem = SPYdata["AVGprem"].iloc[0]
+
+    IWM = data2.query("Date == @currentdate and Delta <= -0.05 and Delta >= -0.4").copy()
+    if IWM.empty:
+        continue
+
+    IWM["w"] = IWM["startvega"] / SPYvega
+    IWM["tuneD"] = np.where(IWM["Delta"] <= -0.05, 1, 1)
+    IWM["tune2"] = np.where(IWM["ret"] >= -0.02, 1, 1)
+    IWM["hedgeret2"] = IWM["hedgeret"] * IWM["tuneD"] * IWM["tune2"]
+    IWM["PnL"] = IWM["startcost"] - IWM["endcost"] - IWM["startspread"] * 0.35 - IWM["hedgeret2"]
+
+    IWM["RBexit"] = 0
+    IWM["time2mat"] = 7
+    IWM["w"] = np.where(IWM["RBexit"] == 2, 1, IWM["w"])
+
+    IWM["portPnL"] = IWM["PnL"] / IWM["w"] - SPYPnL * 0.95
+    IWM["portPnLV"] = IWM["portPnL"] / SPYvegaP
+
+    IWM = IWM.merge(SPYdata, on="Date", how="left")
+
+    # Calculate implied vol, VRP, Greeks, etc.
+    if IWM["RBexit"].iloc[0] == 2:
+        IWM = IWM.assign(
+            IWMVRP=IWM["IV"] - IWM["RV1"],
+            SPYVRP=IWM["AVGIV"] - IWM["RV"],
+        )
+        IWM["VRPgap"] = IWM["IWMVRP"] - IWM["SPYVRP"]
+        IWM["VRPgapabs"] = np.where(IWM["VRPgap"] > 0, IWM["VRPgap"], 1e-10)
+        IWM["IWMVRP2"] = IWM["IV"] - IWM["RV2"]
+        IWM["opw"] = IWM["VRPgapabs"] / IWM["VRPgapabs"].sum()
+        IWM["VRPw1"] = np.where(IWM["IWMVRP"] < IWM["SPYVRP"], 0.0, 1)
+        IWM["VRPw2"] = np.where((IWM["IWMVRP"] < 0) & (IWM["IWMVRP2"] < 0), 0.0, 1)
+    else:
+        IWM = IWM.assign(
+            IWMVRP=IWM["IV"] - IWM["RV1"],
+            SPYVRP=IWM["AVGIV"] - IWM["RV"]
+        )
+        IWM["VRPgap"] = IWM["IWMVRP"] - IWM["SPYVRP"]
+        IWM["VRPgapabs"] = np.where(IWM["VRPgap"] > 0, IWM["VRPgap"], 1e-10)
+        IWM["IWMVRP2"] = IWM["IV"] - IWM["RV2"]
+        IWM["opw"] = IWM["VRPgapabs"] / IWM["VRPgapabs"].sum()
+        IWM["VRPw1"] = np.where(IWM["IWMVRP"] < IWM["SPYVRP"], 0.5, 1)
+        IWM["VRPw2"] = np.where((IWM["IWMVRP"] < 0) & (IWM["IWMVRP2"] < 0), 0.5, 1)
+
+    IWM["T"] = IWM["time2mat"] / 365
+    IWM["d1"] = (np.log(IWM["startprice"] / IWM["K"]) + (IWM["IV"]**2) * IWM["T"] / 2) / (IWM["IV"] * np.sqrt(IWM["T"]))
+    IWM["d2"] = IWM["d1"] - IWM["IV"] * np.sqrt(IWM["T"])
+    IWM["Vomma"] = IWM["startvega"] * (IWM["d1"] * IWM["d2"] / IWM["IV"])
+    IWM["netprem"] = IWM["startcost"] / IWM["w"] - IWM["AVGprem"]
+    IWM["grossprem"] = IWM["startcost"] / IWM["w"] + IWM["AVGprem"]
+    IWM["down"] = IWM["startprice"] * 0.9
+    IWM["optionvalue"] = np.where(IWM["K"] < IWM["down"], 0, IWM["K"] - IWM["down"])
+    IWM["stockvalue"] = -1 * IWM["Delta"] * (IWM["down"] - IWM["startprice"])
+
+    finaldata.append(IWM)
+
+# ============================================================
+# 5) AGGREGATE RESULTS
+# ============================================================
+alltrades = pd.concat(finaldata, ignore_index=True)
+alltrades["VRPw"] = alltrades["VRPw1"] * alltrades["VRPw2"]
+
+# Dates with no trade
+notrade = (
+    alltrades.groupby("Date", as_index=False)["VRPw"]
+    .sum()
+    .query("VRPw < 1e-6")["Date"]
+    .unique()
+)
+print("No-trade Dates:", notrade)
+
+# Final PnL summary
+finalPnL = (
+    alltrades.query("Date >= '2012-01-01'")
+    .groupby("Date", as_index=False)
+    .agg(
+        totalPnL=("portPnL", lambda x: np.mean(x * alltrades.loc[x.index, "VRPw"])),
+        totalPnLV=("portPnLV", lambda x: np.mean(x * alltrades.loc[x.index, "VRPw"]))
+    )
+    .dropna()
+)
+
+# ============================================================
+# 6) PERFORMANCE METRICS
+# ============================================================
+finalPnL["cumPnL_V"] = finalPnL["totalPnLV"].cumsum()
+ann_sharpe = finalPnL["totalPnLV"].mean() / finalPnL["totalPnLV"].std() * np.sqrt(52)
+print(f"\nAnnualized Sharpe (1/VegaP): {ann_sharpe:.2f}")
+
+# Plot cumulative PnL (requires matplotlib)
+import matplotlib.pyplot as plt
+plt.figure(figsize=(10,5))
+plt.plot(pd.to_datetime(finalPnL["Date"]), finalPnL["cumPnL_V"])
+plt.title(f"ETF Pairs 1/VegaP {securityID1}-{securityID2} n_week={nweeks}")
+plt.xlabel("Date")
+plt.ylabel("Cumulative PnL (1/VegaP)")
+plt.grid(True)
+plt.show()
