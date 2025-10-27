@@ -1,0 +1,28 @@
+library(dplyr)
+
+cutoffs <- c(0, 13, 16, 19, 1000)
+
+stats <- check %>%
+  na.omit() %>%
+  mutate(
+    x = get(vars),
+    VIX_grp = cut(
+      VIX,
+      breaks = cutoffs,
+      include.lowest = TRUE,
+      right = FALSE,       # intervals like [0,13), [13,16), ...
+      labels = paste0("[", head(cutoffs, -1), ",", tail(cutoffs, -1), ")")
+    )
+  ) %>%
+  group_by(VIX_grp) %>%
+  summarise(
+    meanreturn = mean(y) * 100,
+    Sharpe = mean(y) / sd(y) * sqrt(252),
+    count = n(),
+    minx = min(x),
+    maxx = max(x),
+    meanxx = mean(x),
+    varname = vars,
+    ID = first(id)
+  ) %>%
+  ungroup()
