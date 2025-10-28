@@ -1,0 +1,364 @@
+
+
+library(xts)
+library(dplyr)
+library(SIT)
+library(ranger)
+library(xgboost)
+library(doParallel)
+library(foreach)
+# library(h2o)
+require(PerformanceAnalytics)
+library(riskParityPortfolio)
+require(quantmod)
+library(lubridate)
+
+library(doParallel)
+library(foreach)
+library(caTools)
+library(zoo)
+library(readxl)
+library(xlsx)
+
+library(readxl)
+library(Rblpapi)
+library(quantmod)
+library(ggplot2)
+library(lubridate)
+library(beepr)
+library(dplyr)
+library(stringr)
+library(tidyr)
+library(RiskPortfolios)
+library(tibbletime)
+last_rank <- function (x)
+{
+  temp=percent_rank(x)
+  return(temp[length(temp)])
+}
+per_roll <- rollify(last_rank, window = 40)
+
+
+blpConnect()
+
+
+#
+# tickers=c("PUT INDEX","BXM INDEX", "BXY INDEX","CLL INDEX","LUATTRUU INDEX","SPVXSP INDEX","QQQ US EQUITY")
+tickers=c("IEF US Equity","SPVXSP INDEX","QQQ US EQUITY","LD12TRUU Index")
+
+
+
+data=bdh(tickers, c("PX_LAST"), start.date=as.Date("1995-01-01"))
+
+n_stocks=length(tickers) #
+alldata=NULL
+
+
+nonIDs=NULL
+# alldata<-foreach (i = 1:n_stocks, .combine="rbind") %dopar%
+for (i in 1:n_stocks)
+{
+  tempdata<-data[[i]]
+  tempdata<-na.omit(tempdata)
+  
+  if(dim(tempdata)[1]<2) 
+  {
+    print(i)
+    print(tickers[i])
+    nonIDs=c(nonIDs,tickers[i])
+    return(NULL)
+  }
+  
+  
+  
+  if (i==2)
+  {
+    newdata=bdh("VXX US EQUITY", c("PX_LAST"), start.date=as.Date("2019-01-01"))
+    lastpoint=tail(newdata,1)
+    lastpoint[,2]=tail(ROC(newdata[,2],type="discrete"),1)
+    lastpoint[,2]=tempdata[nrow(tempdata),2]*(1+lastpoint[,2])
+    if (tempdata[nrow(tempdata),1]<lastpoint[,1])
+    {
+      tempdata<-rbind(tempdata,lastpoint)
+    }
+  }
+  
+  tempxts<-xts(tempdata[,2],order.by = as.Date(tempdata[,1]))
+  
+  if (i==1)
+  {
+    alldata=tempxts
+  } else
+  {
+    alldata=merge.xts(alldata,tempxts,join="inner")
+  }
+  
+  # return(tempdata)
+}
+alldata<-apply.daily(alldata, tail, 1) #the last day in the trading interval
+colnames(alldata)<-str_sub(tickers, start = 1, end = 3)
+
+#reverse the VXX to be XIV
+VXXret<-ROC(alldata[,"SPV"],type = "discrete")
+VXXret[1]=0
+XIVret=-1*VXXret
+XIV<-cumprod(1+XIVret)
+alldata$XIV<-XIV
+
+#get the data from psuedo-ETF
+
+# alldata<-apply(finall+1,2,cumprod)
+# tickers<-IDs
+
+startDate=as.Date("2017-10-01")
+bloombergdaily<-function()
+{
+  
+  VIX=bdh("VIX Index", c("PX_LAST"), start.date=startDate)
+  VX1=bdh("UX1 Index", c("PX_LAST"), start.date=startDate)
+  VX2=bdh("UX2 Index", c("PX_LAST"), start.date=startDate)
+  VVIX=bdh("VVIX Index", c("PX_LAST"), start.date=startDate)
+  SPY=bdh("SPY US Equity", c("PX_LAST"), start.date=startDate)
+  # SKEW=bdh("SKEW Index", c("PX_LAST"), start.date=Sys.Date()-100)
+  
+  VIX<-xts(VIX[,(2)],order.by = as.Date(VIX[,1],origin = "1970-01-01"))
+  VX1<-xts(VX1[,(2)],order.by = as.Date(VX1[,1],origin = "1970-01-01"))
+  VX2<-xts(VX2[,(2)],order.by = as.Date(VX2[,1],origin = "1970-01-01"))
+  VVIX<-xts(VVIX[,(2)],order.by = as.Date(VVIX[,1],origin = "1970-01-01"))
+  SPY<-xts(SPY[,(2)],order.by = as.Date(SPY[,1],origin = "1970-01-01"))
+  # SKEW<-xts(SKEW[,(2)],order.by = as.Date(SKEW[,1],origin = "1970-01-01"))
+  #SKEW is not updated instantly
+  
+  final<-merge.xts(VIX,VX1,join = "outer")
+  final<-merge.xts(final,VX2,join = "outer")
+  final<-merge.xts(final,VVIX,join = "outer")
+  final<-merge.xts(final,SPY,join = "outer")
+  # final<-merge.xts(final,SKEW,join = "outer")
+  head(final)
+  
+  
+  
+  N1=data.frame(read_excel("shoudong.xlsx"))
+  # x.dates = as.Date(N1[,1],format = "%Y-%m-%d")
+  x.dates = as.Date(N1[,1])
+  weights<-xts(N1[,c(7,8)],order.by = x.dates)
+  final<-merge.xts(final,weights,join = "inner")
+  final<-na.omit(final)
+  
+  final$VX20<-final$VX1*final$w1+final$VX2*final$w2
+  final$RB=final$VX20/final$VIX-1
+  # final$RB=-1.00
+  final$RBMA20<-SMA(final$RB,20)
+  final$RBMA5<-SMA(final$RB,5)
+  
+  final$signal=300*final$RB/final$VVIX
+  NAV=1e6
+  
+  return(final)
+  
+}
+
+dailydata<-bloombergdaily()
+
+dailydata$RB_per=per_roll(as.numeric(dailydata$RB))
+dailydata$VIX_per=per_roll(as.numeric(dailydata$VIX))
+#8 is the VIX,1 is the front month and 7 is the constant maturity
+spread=dailydata$RB
+colnames(spread)="spread"
+
+# spread<-EMA(spread,n=5)
+# spread<-rollmedian(spread,k=5,align = "right",na.pad = T)
+
+
+alldata<-merge.xts(alldata,spread,join = "inner")
+
+alldata1=alldata[,c("SPV","QQQ","IEF","LD1","spread")]
+
+#return weights with portfolio returns at the rebalance periods
+weight_cal<-function(pricedata,rebal_freq=5,window=60) # 1 is daily, 5 is weekly, 20 is monthly, price data is xts object
+{
+  
+  if (rebal_freq==1) # daily rebal
+  {
+    rebal_data<-apply.daily(pricedata, tail, 1)
+  } else if (rebal_freq==5) # weekly rebal
+  {
+    rebal_data<-apply.weekly(pricedata, tail, 1)  # monthly rebal
+  } else if (rebal_freq==20)
+  {
+    rebal_data<-apply.monthly(pricedata, tail, 1) # annual rebal
+  } else
+  {
+    rebal_data<-apply.yearly(pricedata, tail, 1)
+  }
+  
+  rebal_dates<-index(rebal_data) # get the time stamp for each rebalance dates
+  
+  #deal with the RB column
+  VRP=rebal_data[,ncol(rebal_data)]
+  rebal_data<-rebal_data[,-ncol(rebal_data)]
+  pricedata<-pricedata[,-ncol(pricedata)]
+  
+  first_date<-index(pricedata)[1] # the first day in the daily data
+  start_date<-first_date+window*365/250+60 # the first date to start the simulation, +60 as a safety buffer, 7/5 is trading day to calendar day
+  
+  start_index=which(rebal_dates>=start_date)[1] # the actual first rebalance date
+  
+  rebal_dates=rebal_dates[-(1:(start_index))] # now those are the weight recalculation dates
+  
+  obs=length(rebal_dates)
+  weights=matrix(data=0,nrow=obs,ncol=ncol(rebal_data)) # portfolio weights
+  Rets=ROC(rebal_data,type = "discrete") # the "weekly" returns for the underlying
+  port_rets=rep(0,obs) # portfolio returns
+  
+  # use a slow for loop as the computation is fast so I opt for simplicity
+  for (i in 1:(obs))
+  {
+    date1=rebal_dates[i]
+    nextdate=rebal_dates[i+1]
+    dateindex<-which(index(pricedata)==date1)
+    
+    
+    VRPdateindex<-which(index(VRP)==date1)
+    tempVRP=as.numeric(VRP[VRPdateindex])
+    if(tempVRP>=0.07) # short VOL
+    {
+      tempprices<-pricedata[(dateindex-window):dateindex,]#-c("SPV")
+      temprets<-ROC(tempprices,type = "discrete")
+      temprets<-na.omit(temprets)
+      temprets[,1]=-1.0*temprets[,1]
+      # temprets=temprets[-nrow(temprets),] # use prev day's cov
+      temprets=temprets[,-4]
+      temprets[,ncol(temprets)]<-1.0*temprets[,ncol(temprets)]
+      
+      IEFret=sum(temprets[,ncol(temprets)])
+      Sigma <- cov(temprets)
+      Sigma=covEstimation(data.matrix(temprets), control = list(type = 'ewma'))
+      # compute risk parity portfolio
+      portfolio <- riskParityPortfolio(Sigma)
+      w=portfolio$w
+      
+      if(IEFret>-0.0)
+      {
+        w=c(w,0)
+      } else
+      {
+        bndw=w[3]
+        w[3]=0
+        w=c(w,bndw)
+      }
+      w[1]=-1*w[1]
+      weights[i,]=c(w)
+      
+      
+    } else if (tempVRP<=-0.07)
+    {
+      tempprices<-pricedata[(dateindex-window):dateindex,]#-c("XIV")
+      temprets<-ROC(tempprices,type = "discrete")
+      temprets<-na.omit(temprets)
+      temprets=temprets[,-4]
+      
+      IEFret=sum(temprets[,ncol(temprets)])
+      Sigma <- cov(temprets)
+      # temprets=temprets[-nrow(temprets),] # use prev day's cov
+      # Sigma=covEstimation(data.matrix(temprets), control = list(type = 'ewma'))
+      # compute risk parity portfolio
+      portfolio <- riskParityPortfolio(Sigma)
+      w=portfolio$w
+      if(IEFret>-1.01)
+      {
+        w=c(w,0)
+      } else
+      {
+        bndw=w[3]
+        w[3]=0
+        w=c(w,bndw)
+      }
+      weights[i,]=c(w)
+    } else
+    {
+      tempprices<-pricedata[(dateindex-window):dateindex,-c(1)] #-c("XIV","SPV")
+      temprets<-ROC(tempprices,type = "discrete")
+      temprets<-na.omit(temprets)
+      temprets=temprets[,-ncol(temprets)]
+      IEFret=sum(temprets[,ncol(temprets)])
+      
+      temprets[,ncol(temprets)]<-1*temprets[,ncol(temprets)]
+      
+      Sigma <- cov(temprets)
+      # temprets=temprets[-nrow(temprets),] # use prev day's cov
+      Sigma=covEstimation(data.matrix(temprets), control = list(type = 'ewma'))
+      # compute risk parity portfolio
+      portfolio <- riskParityPortfolio(Sigma)
+      w=portfolio$w
+      if(IEFret>-0.0)
+      {
+        w=c(0,w,0)
+      } else
+      {
+        bndw=w[2]
+        w[2]=0
+        w=c(0,w,bndw)
+      }
+      
+      weights[i,]=w
+    }
+    
+    
+    #return for next period
+    next_rets=Rets[which(index(Rets)==nextdate),]
+    if (i<obs)
+    {port_rets[i+1]=sum(weights[i,]*as.numeric(next_rets))}
+    
+    
+  }
+  
+  port<-xts(port_rets,order.by = rebal_dates)
+  weights<-xts(weights,order.by = rebal_dates)
+  finaldata<-cbind(weights,port_rets)
+  # colnames(finaldata)<-c(str_sub(tickers, start = 1, end = 4),"port_ret")
+  return(finaldata)
+  
+}
+
+pricedata=alldata1
+final<-weight_cal(alldata1,rebal_freq = 5,window = 60)
+
+strats=final$port_ret
+
+# strats=strats["2010/"]
+
+yearlyReturn(cumprod(1+strats))
+
+print(tail(weeklyReturn(cumprod(1+strats)),20))
+
+# strats=strats["2020-02-14/"]
+colnames(strats)<-c("risk parity Strategy")
+
+# jpeg("HMMstrat.jpg",width=800,height=450)
+charts.PerformanceSummary(strats, main = "SPY/Bond/VXX risk parity + timing Strategy",wealth.index=T,ylog=T)
+
+# dev.off()
+count=100
+kk=rbind(table.AnnualizedReturns(strats), maxDrawdown(strats), CalmarRatio(strats),count)
+rownames(kk)[c(4,6)]=c("Max DD","# of trades")
+print(kk)
+
+port=cumprod(1+strats)
+require("Hmisc")
+Strategy<-monthlyReturn(port)["2000/"]
+result = t(table.CalendarReturns(Strategy))
+rownames(result)[13]<-"Annual Returns"
+
+# jpeg("HMMtable.jpg",width=800,height=450)
+textplot(format.df(result, na.blank=TRUE, numeric.dollar=FALSE,
+                   cdec=rep(1,dim(result)[2])), rmar = 0.8, cmar = 1,
+         max.cex=.9, halign = "center", valign = "top",
+         row.valign="center", wrap.rownames=20, wrap.colnames=10,
+         col.rownames=c( rep("darkgray",12), "black"),
+         mar = c(0,0,3,0)+0.1)
+
+title(main="risk parity Strategy")
+
+
+weights=final[,1:4]
