@@ -1,3 +1,97 @@
+import pandas as pd
+import numpy as np
+
+# ------------------------------------------------------------
+# Ensure tradelog has correct sorting before aggregation
+# ------------------------------------------------------------
+tradelog = tradelog.sort_values(["OptionID", "Date"]).copy()
+
+# ------------------------------------------------------------
+# Perform grouped aggregation (pandas summarise equivalent)
+# ------------------------------------------------------------
+allinfo = (
+    tradelog
+    .groupby("OptionID", as_index=False)
+    .agg({
+        "Date": "first",
+        "Expiration": "first",
+        "Price": ["first", "last"],
+        "spread": ["first", "last"],
+        "K": "first",
+        "ImpliedVolatility": "first",
+        "midprice": "first",
+        "Delta": "first",
+        "lixi": "last",
+        "Vega": "first",
+        "Gamma": "first",
+        "cumHedgePnL": "last",
+        "cumOpPnL": "last",
+        "cumPnL": "last"
+    })
+)
+
+# ------------------------------------------------------------
+# Flatten MultiIndex column names (Date_first → Date, etc.)
+# ------------------------------------------------------------
+allinfo.columns = [
+    "_".join(col).strip("_") for col in allinfo.columns.to_flat_index()
+]
+
+# ------------------------------------------------------------
+# Rename columns to match R output exactly
+# ------------------------------------------------------------
+allinfo = allinfo.rename(columns={
+    "Date_first": "Date",
+    "Expiration_first": "Expiration",
+    "Price_first": "startprice",
+    "Price_last": "endprice",
+    "spread_first": "startspread",
+    "spread_last": "endspread",
+    "K_first": "K",
+    "ImpliedVolatility_first": "IV",
+    "midprice_first": "startcost",
+    "Delta_first": "Delta",
+    "lixi_last": "final_lixi",
+    "Vega_first": "Vega",
+    "Gamma_first": "Gamma",
+    "cumHedgePnL_last": "S_PnL",
+    "cumOpPnL_last": "O_PnL",
+    "cumPnL_last": "cumPnL"
+})
+
+# ------------------------------------------------------------
+# Compute final PnL exactly as in R (placeholders kept)
+# ------------------------------------------------------------
+allinfo["PnL"] = (
+    allinfo["cumPnL"]
+    - 0 * 0.35 * allinfo["startspread"]   # same logic as R
+    + 0 * allinfo["final_lixi"]
+)
+
+# ------------------------------------------------------------
+# Optional: reorder columns for consistency with R output
+# ------------------------------------------------------------
+cols = [
+    "OptionID", "Date", "Expiration",
+    "startprice", "endprice",
+    "startspread", "endspread",
+    "K", "IV", "startcost",
+    "Delta", "final_lixi", "Vega", "Gamma",
+    "S_PnL", "O_PnL", "PnL"
+]
+allinfo = allinfo.reindex(columns=cols)
+
+# ------------------------------------------------------------
+# Done — inspect results
+# ------------------------------------------------------------
+print("✅ allinfo summary table:")
+print(allinfo.head())
+
+####
+
+
+
+
 alldays = np.sort(optiondata["Date"].unique())
 alldf = pd.DataFrame({"Date": pd.to_datetime(alldays), "flag": 1})
 
