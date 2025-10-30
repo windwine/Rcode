@@ -9,6 +9,84 @@ actiondates = (
     .reset_index(drop=True)
 )
 
+# -------------------------------------------------------
+# Pre-sort to make shift() operate correctly within OptionID
+# -------------------------------------------------------
+allinfo = allinfo.sort_values(["OptionID", "Date"]).copy()
+
+# -------------------------------------------------------
+# 1. Drop unwanted columns
+# -------------------------------------------------------
+drop_cols = [c for c in ["Volume", "OpenInterest"] if c in allinfo.columns]
+allinfo = allinfo.drop(columns=drop_cols, errors="ignore")
+
+# -------------------------------------------------------
+# 2. Add K and Intrinsic
+# -------------------------------------------------------
+allinfo["K"] = allinfo["Strike"] / 1000.0
+
+is_call = allinfo["CallPut"] == "C"
+allinfo["Intrinsic"] = np.where(
+    is_call,
+    np.where(allinfo["Price"] > allinfo["K"], allinfo["Price"] - allinfo["K"], 0),
+    np.where(allinfo["Price"] < allinfo["K"], allinfo["K"] - allinfo["Price"], 0)
+)
+
+# -------------------------------------------------------
+# 3. midprice = Intrinsic if Expiration == Date else midprice
+# -------------------------------------------------------
+allinfo["midprice"] = np.where(
+    allinfo["Expiration"] == allinfo["Date"],
+    allinfo["Intrinsic"],
+    allinfo["midprice"]
+)
+
+# -------------------------------------------------------
+# 4. Fix Delta if abs(Delta) > 1
+# -------------------------------------------------------
+sign_from_cp = np.where(is_call, 1, -1)
+has_intr = (allinfo["Intrinsic"] > 1e-9).astype(float)
+mask = allinfo["Delta"].abs() > 1
+allinfo.loc[mask, "Delta"] = sign_from_cp[mask] * has_intr[mask]
+
+# -------------------------------------------------------
+# 5. Compute lags within OptionID groups
+# -------------------------------------------------------
+allinfo["Price_lag"] = allinfo.groupby("OptionID")["Price"].shift(1)
+allinfo["Delta_lag"] = allinfo.groupby("OptionID")["Delta"].shift(1)
+allinfo["Fedrate_lag"] = allinfo.groupby("OptionID")["Fedrate"].shift(1)
+allinfo["Midprice_lag"] = allinfo.groupby("OptionID")["midprice"].shift(1)
+
+# -------------------------------------------------------
+# 6. Derived fields (PnL and components)
+# -------------------------------------------------------
+allinfo["Price_diff"] = allinfo["Price_lag"] * allinfo["ret"]
+allinfo["Op_PnL"] = allinfo["midprice"] - allinfo["Midprice_lag"]
+allinfo["Delta_PnL"] = -1 * allinfo["Delta_lag"] * allinfo["Price_diff"]
+allinfo["PnL"] = allinfo["Op_PnL"] + allinfo["Delta_PnL"]
+allinfo["lixi"] = allinfo["Delta_lag"] * allinfo["Price_lag"] * allinfo["Fedrate_lag"]
+
+# -------------------------------------------------------
+# 7. Replace NAs with 0 for numeric columns
+# -------------------------------------------------------
+num_cols = allinfo.select_dtypes(include=[np.number]).columns
+allinfo[num_cols] = allinfo[num_cols].fillna(0)
+
+# -------------------------------------------------------
+# 8. Cumulative sums within each OptionID (like cumsum)
+# -------------------------------------------------------
+allinfo["cumHedgePnL"] = allinfo.groupby("OptionID")["Delta_PnL"].cumsum()
+allinfo["cumOpPnL"] = allinfo.groupby("OptionID")["Op_PnL"].cumsum()
+allinfo["cumPnL"] = allinfo.groupby("OptionID")["PnL"].cumsum()
+allinfo["cumlixi"] = allinfo.groupby("OptionID")["lixi"].cumsum()
+
+# -------------------------------------------------------
+# 9. Done
+# -------------------------------------------------------
+tradelog = allinfo.drop(columns=["Price_lag","Delta_lag","Fedrate_lag","Midprice_lag"])
+
+print(tradelog.head())
+
 
 
 import pandas as pd
