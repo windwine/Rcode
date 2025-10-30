@@ -1,0 +1,245 @@
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+# =====================================================
+# 0) Paths and config
+# =====================================================
+data_path = Path("d:/Jiaqifiles")
+
+adPrices = pd.read_csv(data_path / "adPrices2ETFadj.csv")
+stockprices = pd.read_csv(data_path / "stockreturnsETF.csv")
+optiondata2 = pd.read_csv(data_path / "2005to2020ETFoptionsfewer.csv")
+
+# =====================================================
+# 1) Preprocess base data
+# =====================================================
+
+# Stock prices setup
+stockprices = (
+    stockprices
+    .assign(SecurityID=lambda df: df["SecurityID"].astype(int))
+    .sort_values(["Date", "SecurityID"])
+)
+
+# Option data filtering and column selection
+optiondata2 = (
+    optiondata2
+    .assign(Date=lambda df: pd.to_datetime(df["Date"]),
+            Expiration=lambda df: pd.to_datetime(df["Expiration"]))
+    .query("Date >= '2009-01-01'")
+    [["SecurityID","Date","Strike","Expiration","CallPut","BestBid","BestOffer",
+      "Delta","Vega","Gamma","Theta","OptionID","ImpliedVolatility","Volume","OpenInterest"]]
+)
+
+# =====================================================
+# 2) ID setup
+# =====================================================
+IDs = [106445,109820,107899,103823]
+names = ["IWM","SPY","QQQ","DIA"]
+delta1s = np.array([-0.05])
+delta2s = np.array([-0.5])
+nweeks = 1
+
+# =====================================================
+# 3) Loop over each delta pair and security
+# =====================================================
+for delta1, delta2 in zip(delta1s, delta2s):
+    print(f"\n=== Running Δ-range {delta1} to {delta2} ===")
+    for securityID, name in zip(IDs, names):
+        print("Processing:", name, securityID)
+
+        # --- Adinfo ---
+        Adinfo = (
+            adPrices
+            .query("SecurityID == @securityID")
+            [["Date","splitAdj","Adj"]]
+            .drop_duplicates()
+            .assign(Date=lambda df: pd.to_datetime(df["Date"]))
+        )
+
+        # --- Option subset ---
+        optiondata = (
+            optiondata2
+            .query("SecurityID == @securityID and Date >= '2011-07-08'")
+            .assign(time2mat=lambda df: (df["Expiration"] - df["Date"]).dt.days)
+            .sort_values(["Date","SecurityID"])
+        )
+
+        alldates = optiondata["Date"].drop_duplicates().sort_values().values
+        if len(alldates) == 0 or alldates[-1] < np.datetime64("2019-12-01"):
+            print("  → Skipped (delisted or insufficient data)")
+            continue
+
+        # --- Read FedFund & RBsignal ---
+        fedfund = (
+            pd.read_csv(data_path / "fedfund.csv")
+            .rename(columns={"Dates":"Date","Fedrate":"Fedrate"})
+            .assign(Date=lambda df: pd.to_datetime(df["Date"], format="%m/%d/%Y"),
+                    Fedrate=lambda df: df["Fedrate"]/100/252)
+        )
+
+        RBsignal = (
+            pd.read_csv(data_path / "newsys3_5_VVIX.csv")
+            .rename(columns={RBsignal.columns[0]: "Date"})
+            .loc[:, ["Date","pos"]]
+            .assign(Date=lambda df: pd.to_datetime(df["Date"]))
+        )
+
+        # =====================================================
+        # 4) Create rebalance dates (weekly)
+        # =====================================================
+        alldays = np.sort(optiondata["Date"].unique())
+        alldf = pd.DataFrame({"Date": pd.to_datetime(alldays), "flag": 1})
+        alldf["week"] = alldf["Date"].dt.to_period("W").apply(lambda r: r.end_time)
+        actiondates = alldf["week"].drop_duplicates().sort_values().reset_index(drop=True)
+
+        results = []
+
+        for i in range(1, len(actiondates)-nweeks):
+            startdate = actiondates[i]
+            enddate = actiondates[i+nweeks]
+            time2exp = (enddate - startdate).days
+
+            tempbuy = optiondata.query("Date == @startdate").copy()
+            if tempbuy.empty:
+                continue
+
+            tempbuy = tempbuy.query("time2mat >= @time2exp")
+            if tempbuy.empty:
+                continue
+
+            shorttest = tempbuy["time2mat"].min()
+            tempbuy = tempbuy.query("time2mat == @shorttest")
+
+            if delta1 < 0:
+                tempbuy = tempbuy.query("CallPut == 'P'")
+            else:
+                tempbuy = tempbuy.query("CallPut == 'C'")
+
+            # Spread ratio filter
+            tempbuy = (
+                tempbuy
+                .assign(spreadratio=(tempbuy["BestOffer"]-tempbuy["BestBid"])/tempbuy["BestOffer"])
+                .query("spreadratio < 0.6")
+            )
+
+            # Find ATM K1 / K2 by delta distance
+            ATM_K1 = (
+                tempbuy.assign(ddelta=(tempbuy["Delta"]-delta1).abs())
+                .loc[lambda df: df["ddelta"]==df["ddelta"].min(),"Strike"]
+                .values
+            )
+            ATM_K2 = (
+                tempbuy.assign(ddelta=(tempbuy["Delta"]-delta2).abs())
+                .loc[lambda df: df["ddelta"]==df["ddelta"].min(),"Strike"]
+                .values
+            )
+            if len(ATM_K1)==0 or len(ATM_K2)==0:
+                continue
+
+            ATM_K1, ATM_K2 = float(ATM_K1[0]), float(ATM_K2[0])
+            if ATM_K1 > ATM_K2:
+                ATM_K1, ATM_K2 = ATM_K2, ATM_K1
+
+            # Filter within the strike band
+            Options = (
+                tempbuy
+                .query("Strike >= @ATM_K1 and Strike <= @ATM_K2 and abs(Delta) < 1")
+                .sort_values("BestOffer")
+                .drop_duplicates(subset=["Strike"], keep="first")
+                .sort_values("Delta")
+            )
+
+            if Options.empty:
+                continue
+
+            OptionIDs = Options["OptionID"].unique()
+
+            # Merge with stockprices, fedfund, and RBsignal
+            merged = (
+                optiondata.query("OptionID in @OptionIDs")
+                .merge(stockprices, on=["Date","SecurityID"], how="inner")
+                .merge(fedfund, on="Date", how="left")
+                .merge(RBsignal, on="Date", how="left")
+                .merge(Adinfo, on="Date", how="left")
+                .assign(
+                    midprice=lambda df: (df["BestBid"]+df["BestOffer"])/2,
+                    spread=lambda df: (df["BestOffer"]-df["BestBid"]).abs(),
+                    Fedrate=lambda df: df["Fedrate"].fillna(method="ffill").fillna(0),
+                    pos=lambda df: df["pos"].fillna(-1),
+                )
+            )
+
+            # Adjust prices for splits
+            merged = (
+                merged
+                .sort_values(["OptionID","Date"])
+                .groupby("OptionID", group_keys=False)
+                .apply(lambda g: g.assign(
+                    splitAdj=g["splitAdj"]/g["splitAdj"].iloc[0],
+                    Price=g["Price"]*g["splitAdj"],
+                    numcontract=g["splitAdj"]
+                ))
+            )
+
+            # Compute PnL components
+            tradelog = (
+                merged
+                .sort_values(["OptionID","Date"])
+                .groupby("OptionID", group_keys=False)
+                .apply(lambda g: g.assign(
+                    K=g["Strike"]/1000,
+                    Intrinsic=np.where(g["CallPut"]=="C",
+                                       np.where(g["Price"]>g["Strike"], g["Price"]-g["Strike"], 0),
+                                       np.where(g["Price"]<g["Strike"], g["Strike"]-g["Price"], 0)),
+                    midprice=np.where(g["Expiration"]==g["Date"], 
+                                      np.where(g["CallPut"]=="C",
+                                               np.where(g["Price"]>g["Strike"], g["Price"]-g["Strike"], 0),
+                                               np.where(g["Price"]<g["Strike"], g["Strike"]-g["Price"], 0)),
+                                      g["midprice"])
+                ))
+            )
+
+            tradelog = tradelog.fillna(0)
+            results.append(tradelog)
+
+        if not results:
+            continue
+
+        alltrades = pd.concat(results, ignore_index=True)
+
+        # Summarize like allinfo
+        allinfo = (
+            alltrades
+            .groupby("OptionID", as_index=False)
+            .agg({
+                "Date": "first",
+                "Expiration": "first",
+                "Price": ["first","last"],
+                "spread": ["first","last"],
+                "Strike": "first",
+                "ImpliedVolatility": "first",
+                "midprice": "first",
+                "Delta": "first",
+                "Vega": "first",
+                "Gamma": "first"
+            })
+        )
+        allinfo.columns = ["OptionID","Date","Expiration","startprice","endprice","startspread","endspread",
+                           "K","IV","startcost","Delta","Vega","Gamma"]
+
+        # Compute cumulative mean PnL like R
+        finall = (
+            allinfo
+            .query("Date >= '2021-01-01'")
+            .groupby("Date", as_index=False)
+            .agg(AVGPnL=("Delta","mean"))  # dummy example; replace with actual PnL later
+            .assign(AUM=lambda df: df["AVGPnL"].cumsum())
+        )
+
+        # Plot with seaborn
+        sns.lineplot(x="Date", y="AUM", data=finall).set_title(name)
+        plt.show()
