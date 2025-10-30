@@ -1,3 +1,23 @@
+
+
+# =====================================================
+# 4) Create rebalance dates (weekly last available date)
+# =====================================================
+
+actiondates = (
+    optiondata
+    .assign(Date=pd.to_datetime(optiondata["Date"]))  # ensure datetime type
+    .sort_values("Date")                              # chronological order
+    .groupby(optiondata["Date"].dt.to_period("W"))["Date"]
+    .max()                                            # last available date in each week
+    .reset_index(drop=True)
+)
+
+print("Sample of actiondates:")
+print(actiondates.head())
+print("Number of rebalancing weeks:", len(actiondates))
+
+
 import pandas as pd
 import numpy as np
 import seaborn as sns
@@ -7,7 +27,7 @@ from pathlib import Path
 # =====================================================
 # 0) Paths and config
 # =====================================================
-data_path = Path("d:/Jiaqifiles")
+
 
 adPrices = pd.read_csv(data_path / "adPrices2ETFadj.csv")
 stockprices = pd.read_csv(data_path / "stockreturnsETF.csv")
