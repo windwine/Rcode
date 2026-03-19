@@ -1,0 +1,134 @@
+================================================================================
+
+DATA FORMAT & TIME PRECISION
+
+1. Real-Time Market Snapshot (analogous to BDP in Bloomberg)
+------------------------------------------------------------
+A single API call to GET /markets/{ticker} returns a live snapshot of any
+contract — the Kalshi equivalent of a Bloomberg BDP() field pull. The response
+includes the full market microstructure in one JSON object:
+
+  Field                    Example       Description
+  -----------------------------------------------------------------------
+  yes_bid_dollars          0.3700        Best bid on YES side
+  yes_ask_dollars          0.3800        Best ask on YES side
+  no_bid_dollars           0.6200        Best bid on NO side
+  no_ask_dollars           0.6300        Best ask on NO side
+  last_price_dollars       0.3700        Last traded price
+  previous_price_dollars   0.4300        Previous session close
+  volume                   246,481       Cumulative contracts traded
+  volume_24h               9,434         24-hour rolling volume
+  open_interest            91,086        Outstanding open contracts
+  yes_bid_size             3,793         Depth at best YES bid
+  yes_ask_size             1,705         Depth at best YES ask
+  status                   active        Market state (active / settled)
+  close_time               2027-01-01    Scheduled expiry
+
+This snapshot is real-time, free, and requires no authentication — structurally
+equivalent to pulling BID, ASK, LAST_PRICE, VOLUME, OPEN_INT via BDP, but for
+event-driven probability contracts rather than traditional securities. Batch
+snapshots across up to 1,000 tickers can be retrieved in a single paginated
+call via GET /markets?tickers=...
+
+
+2. Historical Candlestick Time Series
+--------------------------------------
+Each market also provides full OHLC candlestick data (open, high, low, close
+in dollars), alongside volume and open interest, with the following
+granularities:
+
+  Resolution    Use Case
+  -----------------------------------------------------------------------
+  1-minute      Intraday scalping signals, real-time event monitoring
+  1-hour        Swing-level trend analysis, session-by-session positioning
+  1-day         Macro backdrop, multi-week probability trajectories
+
+Each candle includes open/high/low/close (USD 0.00–1.00, readable directly as
+probability), volume, open_interest, and a UTC-anchored Unix timestamp. Data
+is queryable from each market's inception date.
+
+================================================================================
+
+API ACCESS — SPEED & CONSTRAINTS
+
+- Authentication:         None required for public market data — all reads are
+                          open GET requests
+- Snapshot throughput:    Up to 1,000 tickers per paginated batch; a full
+                          universe refresh takes ~2–3 seconds
+- Candlestick batch:      Up to 100 tickers per request; returns up to 10,000
+                          candles per call
+- Request interval:       ~0.5–1.2 seconds between calls to avoid rate limiting
+- Practical throughput:   ~50–80 markets fully hydrated (hourly + daily candles)
+                          within 3–5 minutes
+- Historical depth:       Settled markets accessible via /historical endpoint —
+                          complete records preserved
+
+================================================================================
+
+CASE STUDY: US-IRAN NUCLEAR DEAL MARKETS
+
+Three contracts are currently trading on whether the US and Iran will reach a
+nuclear agreement by different deadlines. As of March 11, 2026 (live snapshot):
+
+  Contract                        Deadline        Bid    Ask    Last    OI       24h Vol
+  --------------------------------------------------------------------------------------
+  KXUSAIRANAGREEMENT-27-26APR     April 1, 2026   $0.06  $0.08  $0.07   —        —
+  KXUSAIRANAGREEMENT-27-26AUG     Aug 1, 2026     $0.23  $0.25  $0.24   —        —
+  KXUSAIRANAGREEMENT-27           Jan 1, 2027     $0.37  $0.38  $0.37   91,086   9,434
+
+The January 2027 contract opened at $0.80 in early January 2026 and has since
+declined to $0.37 — a 54% collapse in market-implied probability over roughly
+60 trading days, with a $0.01 bid-ask spread and 91K contracts of open interest
+confirming this is a liquid, institutionally-traded signal. The previous session
+close was $0.43, meaning the contract dropped 6 cents in the most recent session
+alone — a meaningful intraday move that would not appear in daily news flow until
+much later.
+
+The term structure across the three contracts implies that while a deal within
+weeks is considered highly unlikely (7%), the market sees roughly 37% odds of a
+deal materializing sometime within 2026 — a nuanced view that no single news
+headline captures cleanly.
+
+================================================================================
+
+HOW THIS HELPS OUR TRADING DESK
+
+1. Geopolitical Risk Quantification for Options Traders
+-------------------------------------------------------
+Options pricing on energy (crude oil futures, XLE) and defense equities
+(RTX, LMT, NOC) embeds implicit assumptions about geopolitical tail risk.
+Iran-related contracts give us a real-time, market-derived probability for
+US-Iran tension resolution — a direct input to vol surface scenarios and
+scenario-weighted delta hedges. When the Jan-2027 contract dropped from 80c
+to 37c, that was a 43-point shift in deal probability that any crude vol trader
+should have been tracking.
+
+2. Rate and Macro Event Positioning for Index Futures Traders
+-------------------------------------------------------------
+Kalshi hosts liquid markets on Fed rate decisions (KXFED), CPI prints (KXCPI),
+GDP (KXGDP), and unemployment (KXUNEMP). These provide hourly-resolution
+probability curves for macro outcomes — far more granular than CME FedWatch,
+and covering events beyond just rate decisions. For S&P 500 and NASDAQ futures
+traders, these probability tracks can sharpen entry/exit timing around data
+releases.
+
+3. Non-Consensus Signal Extraction
+-----------------------------------
+Because Kalshi prices reflect aggregated financial commitment rather than survey
+responses, systematic divergences between Kalshi-implied probabilities and
+consensus analyst views represent exploitable mispricings — either in the
+underlying (if the market is right) or in the contract itself (if it isn't).
+
+4. Automated Integration
+------------------------
+The data pipeline is fully operational: the API is free, no credentials needed,
+and we can refresh any set of tickers in seconds (snapshot) or minutes (full
+candle history) in production. Both snapshot and time-series feeds can be
+ingested directly into our existing quant infrastructure alongside traditional
+market data, with no licensing friction.
+
+================================================================================
+
+Data source: Kalshi public API (CFTC-regulated)
+All prices represent market-implied probabilities
+This summary is for internal research purposes only
